@@ -1,9 +1,12 @@
 package com.hhplus.hhplususerservice.domain.user;
 
 import com.hhplus.hhplususerservice.domain.common.exception.CustomException;
+import com.hhplus.hhplususerservice.domain.event.PaymentEvent;
 import com.hhplus.hhplususerservice.domain.user.command.UserCommand;
 import com.hhplus.hhplususerservice.support.aop.DistributedLock;
 import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.context.ApplicationEventPublisher;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
@@ -14,10 +17,11 @@ import static com.hhplus.hhplususerservice.domain.common.exception.ErrorCode.*;
 
 @Service
 @RequiredArgsConstructor
+@Slf4j
 public class UserService {
 
-
     private final UserRepository userRepository;
+    private final ApplicationEventPublisher publisher;
 
     /**
      * 잔액 조회를 요청하면 유저의 잔액 정보를 반환한다.
@@ -66,14 +70,22 @@ public class UserService {
     }
 
     @Transactional
-    public User usePoint(Long userId, BigDecimal usePoint) {
-        User user = getUser(userId);
-        user.useBalance(usePoint);
-        Optional<User> paidUser = userRepository.saveUser(user);
+    @DistributedLock(key = "'userLock'.concat(':').concat(#command.userId())")
+    public void usePoint(UserCommand.Use command) {
 
-        if (paidUser.isEmpty()) throw new CustomException(USER_FAIL_TO_USE_POINT,
-                "유저가 포인트 사용에 실패하였습니다.");
+        try {
+            User user = getUser(Long.valueOf(command.userId()));
+            user.useBalance(command.amount());
+            userRepository.saveUser(user).orElseThrow(() -> new CustomException(USER_FAIL_TO_USE_POINT,
+                    "유저가 포인트 사용에 실패하였습니다."));
 
-        return paidUser.get();
+            // 토큰 만료를 위한 이벤트 발행
+            publisher.publishEvent(new PaymentEvent(this, command.reservationId(), command.userId(), command.paymentId(),
+                    command.token(), command.amount(), PaymentEvent.EventConstants.DEDUCTION_COMPLETED));
+        } catch (Exception e) {
+            log.error(e.getMessage());
+            publisher.publishEvent(new PaymentEvent(this, command.reservationId(), command.userId(), command.paymentId(),
+                    command.token(), command.amount(), PaymentEvent.EventConstants.DEDUCTION_FAILED));
+        }
     }
 }
